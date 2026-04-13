@@ -263,7 +263,13 @@ app.post('/webhook/:secret', async (req, res) => {
     return res.status(503).json(record.result);
   }
 
-  const result = await executeTrade(signal);
+  let result;
+  try {
+    result = await executeTrade(signal);
+  } catch (err) {
+    log(`❌ Unhandled error in executeTrade: ${err.message}`);
+    result = { ok: false, reason: err.message };
+  }
   record.result = result;
   recentSignals.unshift(record);
   if (recentSignals.length > 50) recentSignals.pop();
