@@ -58,25 +58,30 @@ function sign(secret, ts, method, path, body = '') {
     .digest('base64');
 }
 
+const BITGET_DEMO = process.env.BITGET_DEMO === 'true';
+
 function apiRequest(creds, method, path, body = null) {
   return new Promise((resolve, reject) => {
     const ts      = Date.now().toString();
     const bodyStr = body ? JSON.stringify(body) : '';
     const sig     = sign(creds.secret, ts, method, path, bodyStr);
 
+    const headers = {
+      'Content-Type':       'application/json',
+      'ACCESS-KEY':         creds.apiKey,
+      'ACCESS-SIGN':        sig,
+      'ACCESS-TIMESTAMP':   ts,
+      'ACCESS-PASSPHRASE':  creds.passphrase,
+      locale:               'en-US',
+    };
+    if (BITGET_DEMO) headers['paptrading'] = '1';
+
     const req = https.request(
       {
         hostname: 'api.bitget.com',
         path,
         method,
-        headers: {
-          'Content-Type':       'application/json',
-          'ACCESS-KEY':         creds.apiKey,
-          'ACCESS-SIGN':        sig,
-          'ACCESS-TIMESTAMP':   ts,
-          'ACCESS-PASSPHRASE':  creds.passphrase,
-          locale:               'en-US',
-        },
+        headers,
       },
       (res) => {
         let d = '';
