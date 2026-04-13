@@ -1,341 +1,385 @@
-import { createHmac } from "crypto";
-import https from "https";
-import { existsSync, readFileSync, writeFileSync } from "fs";
+/**
+ * TradingView → Bitget Bridge Scalper
+ *
+ * TradingView IS the signal engine — no internal indicators here.
+ * The SMC Scalper Pine Script ("SMC Scalper v1.0") must be loaded on
+ * the TradingView chart. This script cycles through each symbol by
+ * switching the TV chart, reads the latest signal label drawn by the
+ * Pine Script, then executes the corresponding trade on Bitget spot.
+ *
+ * Setup:
+ *   1. Open TradingView Desktop with --remote-debugging-port=9222
+ *   2. Add the SMC Scalper Pine Script to your chart
+ *   3. Fill in Bitget credentials + settings in .env
+ *   4. node scalper-run.js
+ */
 
-// Load .env
-readFileSync(new URL(".env", import.meta.url), "utf8")
-  .split("\n")
-  .forEach((line) => {
-    const [k, ...v] = line.split("=");
-    if (k && !k.startsWith("#") && v.length)
-      process.env[k.trim()] = v.join("=").trim();
-  });
+import { getPineLabels }                        from './src/core/data.js';
+import { setSymbol, getState }                  from './src/core/chart.js';
+import {
+  isConfigured, getBalances, getPrice,
+  placeOrder, getOrder,
+  placeSellWithRetry, validateSymbols,
+}                                               from './src/core/bitget.js';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 
-const API_KEY = process.env.BITGET_API_KEY;
-const SECRET_KEY = process.env.BITGET_SECRET_KEY;
-const PASSPHRASE = process.env.BITGET_PASSPHRASE;
+// ── Config (all overridable via .env) ─────────────────────────────────────────
 
-const SYMBOL = "XRPUSDT"; // XRP/USDT spot — low price, above min order size
-const INTERVAL_MS = 10000; // 10 seconds
-const TOTAL_TRADES = 6;
+const PAPER_TRADE       = process.env.PAPER_TRADE      !== 'false'; // default ON
+const PAPER_USDT_START  = parseFloat(process.env.PAPER_USDT_START  || '1000');
+const TRADE_SIZE_USDT   = parseFloat(process.env.TRADE_SIZE_USDT   || '1');
+const INTERVAL_MS       = parseInt(process.env.INTERVAL_MS         || '30000'); // 30s between full cycles
+const CHART_SETTLE_MS   = parseInt(process.env.CHART_SETTLE_MS     || '2000');  // wait after switching symbol
+const STUDY_FILTER      = process.env.STUDY_FILTER                 || 'SMC Scalper';
 
-// ── BitGet helpers ──────────────────────────────────────────────
-function sign(ts, method, path, body = "") {
-  return createHmac("sha256", SECRET_KEY)
-    .update(ts + method + path + body)
-    .digest("base64");
+// ── Symbol table ──────────────────────────────────────────────────────────────
+// tvSymbol  : the symbol name to set in TradingView (exchange-prefixed if needed)
+// pair      : the Bitget spot symbol
+// coin      : base asset name (used for sell sizing + lock retry)
+// decimals  : precision for sell quantity
+
+const SYMBOLS = [
+  { tvSymbol: 'BTCUSDT', pair: 'BTCUSDT', coin: 'BTC', decimals: 6 },
+  { tvSymbol: 'ETHUSDT', pair: 'ETHUSDT', coin: 'ETH', decimals: 4 },
+  { tvSymbol: 'XRPUSDT', pair: 'XRPUSDT', coin: 'XRP', decimals: 2 },
+  { tvSymbol: 'SOLUSDT', pair: 'SOLUSDT', coin: 'SOL', decimals: 2 },
+  { tvSymbol: 'BNBUSDT', pair: 'BNBUSDT', coin: 'BNB', decimals: 3 },
+];
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function floorTo(n, d) { return Math.floor(n * 10 ** d) / 10 ** d; }
+function sleep(ms)     { return new Promise((r) => setTimeout(r, ms)); }
+function pad(s, n)     { return String(s).padEnd(n); }
+function pnlStr(n)     { return (n >= 0 ? '+' : '') + n.toFixed(4); }
+
+/** Parse the most recent Pine Script label → action + metadata */
+function parseLatestSignal(labels = []) {
+  if (!labels.length) return { action: 'flat', text: null, price: null };
+  // Labels are returned oldest-first; the last entry is the most recent signal
+  const latest = labels[labels.length - 1];
+  const text   = (latest.text || '').trim();
+  const price  = latest.price ?? null;
+  if (/buy/i.test(text))  return { action: 'buy',  text, price };
+  if (/sell/i.test(text)) return { action: 'sell', text, price };
+  return { action: 'flat', text, price };
 }
 
-function request(method, path, body = null) {
-  return new Promise((resolve, reject) => {
-    const ts = Date.now().toString();
-    const bodyStr = body ? JSON.stringify(body) : "";
-    const sig = sign(ts, method, path, bodyStr);
-    const req = https.request(
-      {
-        hostname: "api.bitget.com",
-        path,
-        method,
-        headers: {
-          "Content-Type": "application/json",
-          "ACCESS-KEY": API_KEY,
-          "ACCESS-SIGN": sig,
-          "ACCESS-TIMESTAMP": ts,
-          "ACCESS-PASSPHRASE": PASSPHRASE,
-          locale: "en-US",
-        },
-      },
-      (res) => {
-        let d = "";
-        res.on("data", (c) => (d += c));
-        res.on("end", () => resolve(JSON.parse(d)));
-      },
-    );
-    req.on("error", reject);
-    if (bodyStr) req.write(bodyStr);
-    req.end();
-  });
+/** Unique key for a signal — used to avoid re-executing the same label twice */
+function signalKey(text, price) {
+  return `${text}@${price ?? '?'}`;
 }
 
-// ── Market data ─────────────────────────────────────────────────
-async function getCandles(symbol, limit = 30) {
-  // 1-minute candles from BitGet
-  const res = await request(
-    "GET",
-    `/api/v2/spot/market/candles?symbol=${symbol}&granularity=1min&limit=${limit}`,
-  );
-  // returns [[ts, open, high, low, close, vol], ...]
-  return (res.data || []).map((c) => ({
-    ts: parseInt(c[0]),
-    open: parseFloat(c[1]),
-    high: parseFloat(c[2]),
-    low: parseFloat(c[3]),
-    close: parseFloat(c[4]),
-    vol: parseFloat(c[5]),
-  }));
-}
-
-async function getPrice(symbol) {
-  const res = await request(
-    "GET",
-    `/api/v2/spot/market/tickers?symbol=${symbol}`,
-  );
-  return parseFloat(res.data?.[0]?.lastPr || 0);
-}
-
-async function getBalances() {
-  const res = await request("GET", "/api/v2/spot/account/assets");
-  const usdt = res.data?.find((a) => a.coin === "USDT");
-  const xrp = res.data?.find((a) => a.coin === "XRP");
-  return {
-    usdt: parseFloat(usdt?.available || 0),
-    xrp: parseFloat(xrp?.available || 0),
-  };
-}
-
-// ── Indicators ──────────────────────────────────────────────────
-function calcEMA(closes, period) {
-  const k = 2 / (period + 1);
-  let ema = closes[0];
-  for (let i = 1; i < closes.length; i++) ema = closes[i] * k + ema * (1 - k);
-  return ema;
-}
-
-function calcRSI(closes, period = 3) {
-  if (closes.length < period + 1) return 50;
-  let gains = 0,
-    losses = 0;
-  for (let i = closes.length - period; i < closes.length; i++) {
-    const diff = closes[i] - closes[i - 1];
-    if (diff > 0) gains += diff;
-    else losses -= diff;
-  }
-  if (losses === 0) return 100;
-  const rs = gains / losses;
-  return 100 - 100 / (1 + rs);
-}
-
-function calcVWAP(candles) {
-  // Session VWAP approximation (all candles provided)
-  let cumTPV = 0,
-    cumVol = 0;
-  for (const c of candles) {
-    const tp = (c.high + c.low + c.close) / 3;
-    cumTPV += tp * c.vol;
-    cumVol += c.vol;
-  }
-  return cumVol === 0 ? candles[candles.length - 1].close : cumTPV / cumVol;
-}
-
-// ── Signal logic (mirrors Pine Script) ─────────────────────────
-function getSignal(candles) {
-  const closes = candles.map((c) => c.close);
-  const last = closes[closes.length - 1];
-
-  const ema8 = calcEMA(closes, 8);
-  const rsi3 = calcRSI(closes, 3);
-  const vwap = calcVWAP(candles);
-
-  const bullBias = last > vwap && last > ema8;
-  const bearBias = last < vwap && last < ema8;
-
-  let signal = "flat";
-  if (bullBias && rsi3 < 30) signal = "buy";
-  else if (bearBias && rsi3 > 70) signal = "sell";
-
-  return { signal, last, ema8, rsi3, vwap };
-}
-
-// ── Order helpers ───────────────────────────────────────────────
-async function placeOrder(side, size) {
-  const body = {
-    symbol: SYMBOL,
-    side,
-    orderType: "market",
-    force: "gtc",
-    size,
-  };
-  return request("POST", "/api/v2/spot/trade/place-order", body);
-}
-
-async function getOrderFill(orderId) {
-  for (let i = 0; i < 5; i++) {
-    await new Promise((r) => setTimeout(r, 1000));
-    const res = await request(
-      "GET",
-      `/api/v2/spot/trade/orderInfo?orderId=${orderId}&symbol=${SYMBOL}`,
-    );
-    const fill = parseFloat(res.data?.baseVolume || 0);
-    if (fill > 0) return fill;
+async function waitForFill(orderId, pair, retries = 5) {
+  for (let i = 0; i < retries; i++) {
+    await sleep(1000);
+    try {
+      const data   = await getOrder(orderId, pair);
+      const filled = parseFloat(data?.baseVolume || 0);
+      if (filled > 0) return filled;
+    } catch { /* retry */ }
   }
   return 0;
 }
 
-// BitGet locks newly purchased assets against immediate resale (anti-wash-trading).
-// This retries the sell, parsing the actually-available amount from the error
-// message until the lock lifts or we time out.
-async function placeSellWithRetry(qty, maxRetries = 12, retryDelayMs = 3000) {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    const size = (Math.floor(qty * 10000) / 10000).toFixed(4);
-    const res = await placeOrder("sell", size);
+// ── Paper trading ─────────────────────────────────────────────────────────────
 
-    if (res.code === "00000")
-      return { ok: true, res, soldQty: parseFloat(size) };
+const paper = {
+  usdt:      PAPER_USDT_START,
+  positions: new Map(), // pair → { qty, entryPrice, cost }
+  trades:    [],
+};
 
-    // Parse available qty from lock error: "0.001234XRP can be used at most"
-    const lockMatch = res.msg?.match(/([\d.]+)XRP can be used at most/i);
-    if (lockMatch) {
-      const available = parseFloat(lockMatch[1]);
-      console.log(
-        `  🔒 Lock active — only ${available} XRP tradeable. Retry ${attempt}/${maxRetries} in ${retryDelayMs / 1000}s...`,
-      );
-      await new Promise((r) => setTimeout(r, retryDelayMs));
-      continue;
-    }
-
-    // Any other error — don't retry
-    return { ok: false, res, soldQty: 0 };
-  }
-  return {
-    ok: false,
-    res: { msg: "Sell lock never lifted after retries" },
-    soldQty: 0,
-  };
+function paperBuy(pair, usdtAmount, price, decimals) {
+  const qty        = floorTo(usdtAmount / price, decimals);
+  paper.usdt      -= usdtAmount;
+  paper.positions.set(pair, { qty, entryPrice: price, cost: usdtAmount });
+  paper.trades.push({ ts: new Date().toISOString(), pair, side: 'buy', qty, price, cost: usdtAmount });
+  return { qty, cost: usdtAmount };
 }
 
-// ── Main loop ───────────────────────────────────────────────────
-async function main() {
-  console.log(`\n🤖 BTC Scalper — VWAP + RSI(3) + EMA(8)`);
-  console.log(
-    `Symbol: ${SYMBOL} | ${TOTAL_TRADES} trades × ${INTERVAL_MS / 1000}s\n`,
-  );
+function paperSell(pair, qty, price) {
+  const proceeds = qty * price;
+  const pos      = paper.positions.get(pair);
+  const pnl      = pos ? (price - pos.entryPrice) * qty : 0;
+  paper.usdt    += proceeds;
+  paper.positions.delete(pair);
+  paper.trades.push({ ts: new Date().toISOString(), pair, side: 'sell', qty, price, proceeds, pnl });
+  return { proceeds, pnl };
+}
 
-  const log = [];
-  let holding = "usdt";
-  let lastBuyXrpQty = 0;
+// ── Signal reading from TradingView ───────────────────────────────────────────
 
-  for (let i = 1; i <= TOTAL_TRADES; i++) {
-    const ts = new Date().toISOString();
-    const candles = await getCandles(SYMBOL, 30);
-    const { signal, last, ema8, rsi3, vwap } = getSignal(candles);
-    const bals = await getBalances();
+/**
+ * Switch TradingView to `tvSymbol`, wait for the Pine Script to settle,
+ * then return the latest signal from the SMC Scalper indicator.
+ */
+async function readTVSignal(tvSymbol) {
+  await setSymbol({ symbol: tvSymbol });
+  await sleep(CHART_SETTLE_MS); // Pine needs time to recalculate on the new symbol
 
-    console.log(`[${i}/${TOTAL_TRADES}] ${ts}`);
-    console.log(
-      `  Price: $${last.toFixed(4)} | EMA8: ${ema8.toFixed(4)} | RSI3: ${rsi3.toFixed(1)} | VWAP: ${vwap.toFixed(4)}`,
-    );
-    console.log(
-      `  USDT: $${bals.usdt.toFixed(4)} | XRP: ${bals.xrp.toFixed(4)} | Signal: ${signal.toUpperCase()}`,
-    );
+  const result = await getPineLabels({ study_filter: STUDY_FILTER, max_labels: 5 });
+  const study  = result?.studies?.[0];
 
-    let side, size, label;
-    const entry = {
-      tick: i,
-      timestamp: ts,
-      price: last,
-      ema8,
-      rsi3,
-      vwap,
-      signal,
-      orderPlaced: false,
-    };
-
-    if (signal === "buy" && holding === "usdt" && bals.usdt >= 1) {
-      side = "buy";
-      size = (bals.usdt * 0.9).toFixed(4);
-      label = `BUY XRP with $${size} USDT`;
-      holding = "xrp";
-    } else if (signal === "sell" && holding === "xrp" && lastBuyXrpQty >= 1) {
-      side = "sell";
-      size = (Math.floor(lastBuyXrpQty * 10000) / 10000).toFixed(4);
-      label = `SELL ${size} XRP → USDT`;
-      holding = "usdt";
-    } else {
-      const reason =
-        signal === "flat"
-          ? "no signal — conditions not met"
-          : `signal=${signal} but holding=${holding} (waiting for right side)`;
-      console.log(`  ⏭  Skip — ${reason}\n`);
-      entry.skipped = true;
-      entry.skipReason = reason;
-      log.push(entry);
-      if (i < TOTAL_TRADES)
-        await new Promise((r) => setTimeout(r, INTERVAL_MS));
-      continue;
-    }
-
-    console.log(`  → ${label}`);
-    entry.side = side;
-    entry.size = size;
-
-    if (side === "buy") {
-      const res = await placeOrder("buy", size);
-      const ok = res.code === "00000";
-      const orderId = res.data?.orderId;
-      entry.orderId = orderId || res.msg;
-      entry.orderPlaced = ok;
-
-      if (ok) {
-        console.log(`  ✅ BUY PLACED — ${orderId}`);
-        lastBuyXrpQty = await getOrderFill(orderId);
-        console.log(
-          `  📦 Filled: ${lastBuyXrpQty.toFixed(4)} XRP — waiting for lock to clear...`,
-        );
-        entry.filledQty = lastBuyXrpQty;
-      } else {
-        console.log(`  ❌ Rejected: ${res.msg}`);
-        holding = "usdt";
-      }
-    } else {
-      // Use retry loop — handles BitGet's anti-wash-trading lock automatically
-      const { ok, res, soldQty } = await placeSellWithRetry(lastBuyXrpQty);
-      entry.orderId = res.data?.orderId || res.msg;
-      entry.orderPlaced = ok;
-
-      if (ok) {
-        console.log(
-          `  ✅ SELL PLACED — ${entry.orderId} (${soldQty.toFixed(4)} XRP)`,
-        );
-        lastBuyXrpQty = 0;
-      } else {
-        console.log(`  ❌ Sell failed: ${res.msg}`);
-        holding = "xrp"; // still holding
-      }
-    }
-
-    log.push(entry);
-
-    if (i < TOTAL_TRADES) {
-      const waitMs =
-        side === "buy" ? Math.max(INTERVAL_MS - 5000, 4000) : INTERVAL_MS;
-      console.log(`  ⏱  Next in ${waitMs / 1000}s...\n`);
-      await new Promise((r) => setTimeout(r, waitMs));
-    }
+  if (!study) {
+    return { action: 'flat', text: null, price: null, studyFound: false };
   }
 
-  const final = await getBalances();
-  const price = await getPrice(SYMBOL);
-  const totalValue = final.usdt + final.xrp * price;
-  console.log(`\n📊 Final:`);
-  console.log(`  USDT: $${final.usdt.toFixed(4)}`);
-  console.log(
-    `  XRP: ${final.xrp.toFixed(4)} (≈$${(final.xrp * price).toFixed(4)})`,
-  );
-  console.log(`  Total est. value: $${totalValue.toFixed(4)}`);
+  return { ...parseLatestSignal(study.labels), studyFound: true, labelCount: study.total_labels };
+}
 
-  const placed = log.filter((e) => e.orderPlaced).length;
-  console.log(`\n✅ Done — ${placed}/${TOTAL_TRADES} orders placed.\n`);
+// ── Main ──────────────────────────────────────────────────────────────────────
 
-  const existing = existsSync("safety-check-log.json")
-    ? JSON.parse(readFileSync("safety-check-log.json", "utf8"))
-    : [];
-  writeFileSync(
-    "safety-check-log.json",
-    JSON.stringify([...existing, ...log], null, 2),
-  );
+async function main() {
+  if (!isConfigured()) {
+    console.error('❌  Bitget credentials missing. Add BITGET_API_KEY, BITGET_SECRET_KEY and BITGET_PASSPHRASE to .env');
+    process.exit(1);
+  }
+
+  // ── Symbol availability check ─────────────────────────────────────────────
+  console.log('\n🔍  Checking symbol availability on Bitget spot market...');
+  let activeSymbols;
+  try {
+    const { available, unavailable } = await validateSymbols(SYMBOLS.map((s) => s.pair));
+    if (unavailable.length) {
+      console.warn(`  ⚠  Not on Bitget spot: ${unavailable.join(', ')} — skipping`);
+    }
+    if (!available.length) {
+      console.error('  ❌  No symbols available. Exiting.');
+      process.exit(1);
+    }
+    activeSymbols = SYMBOLS.filter((s) => available.includes(s.pair));
+    console.log(`  ✅  Active: ${activeSymbols.map((s) => s.pair).join(', ')}`);
+  } catch (err) {
+    console.error(`  ❌  Symbol check failed: ${err.message}`);
+    process.exit(1);
+  }
+
+  // ── TradingView connection check ──────────────────────────────────────────
+  console.log('\n📡  Checking TradingView connection...');
+  try {
+    const state = await getState();
+    console.log(`  ✅  TradingView connected — currently on ${state.symbol} (${state.resolution}m)`);
+    const hasSMC = state.studies?.some((s) => s.name?.includes('SMC'));
+    if (!hasSMC) {
+      console.warn(`  ⚠  "${STUDY_FILTER}" not detected on current chart.`);
+      console.warn(`     Add the SMC Scalper Pine Script indicator to your TradingView chart before trading.`);
+    }
+  } catch (err) {
+    console.error(`  ❌  TradingView not reachable: ${err.message}`);
+    console.error(`     Make sure TradingView is running with --remote-debugging-port=9222`);
+    process.exit(1);
+  }
+
+  // ── Banner ────────────────────────────────────────────────────────────────
+  const modeTag = PAPER_TRADE
+    ? `📄  PAPER MODE  (virtual $${PAPER_USDT_START.toFixed(2)} USDT — no real orders)`
+    : `🔴  LIVE MODE   (real orders on Bitget)`;
+
+  console.log(`\n🤖  TradingView → Bitget Bridge Scalper`);
+  console.log(`    Signal engine : TradingView Pine Script ("${STUDY_FILTER}")`);
+  console.log(`    ${modeTag}`);
+  console.log(`Symbols  : ${activeSymbols.map((s) => s.pair).join(', ')}`);
+  console.log(`Interval : ${INTERVAL_MS / 1000}s between cycles  |  Chart settle: ${CHART_SETTLE_MS / 1000}s`);
+  console.log(`Trade    : $${TRADE_SIZE_USDT.toFixed(2)} per symbol`);
+  console.log(`\nPress Ctrl+C to stop.\n`);
+
+  // ── State ─────────────────────────────────────────────────────────────────
+  const state      = new Map(activeSymbols.map((s) => [s.pair, { holding: 'usdt', buyQty: 0 }]));
+  const lastActed  = new Map(); // pair → signal key we last executed
+  const log        = [];
+  let   cycle      = 0;
+
+  // ── Graceful shutdown ─────────────────────────────────────────────────────
+  process.on('SIGINT', async () => {
+    console.log('\n\n⛔  Stopping scalper...');
+    await printSummary(activeSymbols, state);
+    persistLog(log);
+    process.exit(0);
+  });
+
+  // ── Main loop (runs indefinitely) ─────────────────────────────────────────
+  while (true) {
+    cycle++;
+    const ts = new Date().toISOString();
+
+    console.log(`\n${'─'.repeat(66)}`);
+    console.log(`Cycle ${cycle}  ${ts}${PAPER_TRADE ? '  [PAPER]' : '  [LIVE]'}`);
+    console.log('─'.repeat(66));
+
+    // Current balance
+    let usdtBalance = PAPER_TRADE ? paper.usdt : 0;
+    if (!PAPER_TRADE) {
+      try {
+        const assets  = await getBalances(['USDT']);
+        usdtBalance   = parseFloat(assets[0]?.available || 0);
+      } catch (err) {
+        console.warn(`  ⚠  Balance fetch failed: ${err.message}`);
+      }
+    }
+    console.log(`  USDT balance: $${usdtBalance.toFixed(4)}  |  Trade size: $${TRADE_SIZE_USDT.toFixed(2)}\n`);
+
+    for (const sym of activeSymbols) {
+      const { tvSymbol, pair, coin, decimals } = sym;
+      const s     = state.get(pair);
+      const entry = { cycle, ts, pair, paper: PAPER_TRADE, holding: s.holding };
+
+      try {
+        // ── Read signal from TradingView ────────────────────────────────────
+        const { action, text, price, studyFound } = await readTVSignal(tvSymbol);
+
+        if (!studyFound) {
+          console.log(`  ${pad(pair, 9)} ⚠  "${STUDY_FILTER}" not found on chart — add indicator in TradingView`);
+          entry.error = 'study_not_found';
+          log.push(entry);
+          continue;
+        }
+
+        // Dedup — skip if this is the same signal we already acted on
+        const key     = signalKey(text, price);
+        const prevKey = lastActed.get(pair);
+        const isNew   = key !== prevKey && action !== 'flat';
+
+        console.log(
+          `  ${pad(pair, 9)}` +
+          `tv_signal=${pad(action.toUpperCase(), 5)}  ` +
+          `label="${text ?? 'none'}"  ` +
+          `${isNew ? '🆕' : '↩ same'}  ` +
+          `holding=${s.holding.toUpperCase()}`
+        );
+
+        Object.assign(entry, { action, tvLabel: text, tvPrice: price, isNew });
+
+        if (!isNew || action === 'flat') {
+          entry.skipped = true;
+          entry.skipReason = action === 'flat' ? 'no_signal' : 'duplicate_signal';
+          log.push(entry);
+          continue;
+        }
+
+        // ── Get current Bitget price for paper fills ────────────────────────
+        let currentPrice = price; // use Pine label price as fallback
+        try {
+          const ticker = await getPrice(pair);
+          currentPrice = ticker.last;
+        } catch { /* use Pine price */ }
+
+        // ── BUY ─────────────────────────────────────────────────────────────
+        if (action === 'buy' && s.holding === 'usdt') {
+          const alloc = TRADE_SIZE_USDT;
+          if ((PAPER_TRADE ? paper.usdt : usdtBalance) < alloc) {
+            console.log(`    ⏭  Skip BUY — insufficient USDT ($${(PAPER_TRADE ? paper.usdt : usdtBalance).toFixed(2)} < $${alloc})`);
+            entry.skipped = true; entry.skipReason = 'insufficient_usdt';
+          } else if (PAPER_TRADE) {
+            const { qty, cost } = paperBuy(pair, alloc, currentPrice, decimals);
+            s.holding = 'coin'; s.buyQty = qty;
+            console.log(`    📄 PAPER BUY  $${cost.toFixed(4)} → ${qty.toFixed(decimals)} ${coin} @ ${currentPrice.toFixed(5)}`);
+            Object.assign(entry, { side: 'buy', cost, qty, fillPrice: currentPrice, orderPlaced: true });
+            lastActed.set(pair, key);
+          } else {
+            const size = alloc.toFixed(4);
+            const data = await placeOrder({ symbol: pair, side: 'buy', size, orderType: 'market' });
+            const oid  = data?.orderId;
+            console.log(`    ✅ BUY placed — ${oid}`);
+            const filled = await waitForFill(oid, pair);
+            s.holding = 'coin'; s.buyQty = filled;
+            console.log(`    📦 Filled: ${filled.toFixed(decimals)} ${coin}`);
+            Object.assign(entry, { side: 'buy', size, orderId: oid, filledQty: filled, orderPlaced: true });
+            lastActed.set(pair, key);
+          }
+
+        // ── SELL ─────────────────────────────────────────────────────────────
+        } else if (action === 'sell' && s.holding === 'coin' && s.buyQty > 0) {
+          const qty = floorTo(s.buyQty, decimals);
+          if (PAPER_TRADE) {
+            const { proceeds, pnl } = paperSell(pair, qty, currentPrice);
+            s.holding = 'usdt'; s.buyQty = 0;
+            console.log(`    📄 PAPER SELL ${qty.toFixed(decimals)} ${coin} @ ${currentPrice.toFixed(5)} → $${proceeds.toFixed(4)}  PnL: ${pnlStr(pnl)}`);
+            Object.assign(entry, { side: 'sell', qty, proceeds, pnl, fillPrice: currentPrice, orderPlaced: true });
+            lastActed.set(pair, key);
+          } else {
+            const result = await placeSellWithRetry(pair, qty, { coinSymbol: coin });
+            if (result.ok) {
+              console.log(`    ✅ SELL placed — ${result.orderId}  (${result.soldQty} ${coin})`);
+              s.holding = 'usdt'; s.buyQty = 0;
+              Object.assign(entry, { side: 'sell', qty, orderId: result.orderId, soldQty: result.soldQty, orderPlaced: true });
+              lastActed.set(pair, key);
+            } else {
+              console.log(`    ❌ SELL failed — ${result.error}`);
+              Object.assign(entry, { side: 'sell', orderPlaced: false, error: result.error });
+            }
+          }
+
+        // ── Signal exists but can't act (e.g. buy signal while already holding) ──
+        } else {
+          console.log(`    ⏭  Skip — signal=${action} but holding=${s.holding}`);
+          entry.skipped = true; entry.skipReason = `signal=${action}_holding=${s.holding}`;
+          lastActed.set(pair, key); // still mark as seen so we don't retry
+        }
+
+      } catch (err) {
+        console.error(`    ❌ Error (${pair}): ${err.message}`);
+        entry.error = err.message;
+      }
+
+      log.push(entry);
+    }
+
+    console.log(`\n  ⏱  Next cycle in ${INTERVAL_MS / 1000}s...`);
+    await sleep(INTERVAL_MS);
+  }
+}
+
+// ── Summary + log helpers ─────────────────────────────────────────────────────
+
+async function printSummary(activeSymbols, state) {
+  console.log(`\n${'═'.repeat(66)}`);
+  console.log(`📊  Session summary  ${PAPER_TRADE ? '[PAPER]' : '[LIVE]'}`);
+  console.log('═'.repeat(66));
+
+  if (PAPER_TRADE) {
+    let totalValue = paper.usdt;
+    for (const sym of activeSymbols) {
+      const pos = paper.positions.get(sym.pair);
+      if (pos) {
+        try {
+          const { last } = await getPrice(sym.pair);
+          const value     = pos.qty * last;
+          totalValue     += value;
+          console.log(`  ${pad(sym.pair, 9)} HOLDING ${pos.qty.toFixed(sym.decimals)} ${sym.coin}  entry=$${pos.entryPrice.toFixed(5)}  now=$${last.toFixed(5)}  PnL: ${pnlStr((last - pos.entryPrice) * pos.qty)}`);
+        } catch {
+          console.log(`  ${pad(sym.pair, 9)} HOLDING ${pos.qty.toFixed(sym.decimals)} ${sym.coin}`);
+        }
+      } else {
+        console.log(`  ${pad(sym.pair, 9)} FLAT`);
+      }
+    }
+    const realised = paper.trades.filter((t) => t.side === 'sell').reduce((s, t) => s + t.pnl, 0);
+    console.log(`\n  Start : $${PAPER_USDT_START.toFixed(4)}`);
+    console.log(`  Cash  : $${paper.usdt.toFixed(4)}`);
+    console.log(`  Total : $${totalValue.toFixed(4)}`);
+    console.log(`  PnL   : ${pnlStr(realised)} (realised)`);
+    if (paper.trades.length) {
+      console.log(`\n  Trade history:`);
+      paper.trades.forEach((t) => {
+        if (t.side === 'buy')
+          console.log(`    BUY  ${t.pair}  ${t.qty.toFixed(4)} @ ${t.price.toFixed(5)}  cost=$${t.cost.toFixed(4)}`);
+        else
+          console.log(`    SELL ${t.pair}  ${t.qty.toFixed(4)} @ ${t.price.toFixed(5)}  proceeds=$${t.proceeds.toFixed(4)}  PnL=${pnlStr(t.pnl)}`);
+      });
+    }
+  }
+  console.log('═'.repeat(66));
+}
+
+function persistLog(log) {
+  const logPath  = 'safety-check-log.json';
+  const existing = existsSync(logPath) ? JSON.parse(readFileSync(logPath, 'utf8')) : [];
+  writeFileSync(logPath, JSON.stringify([...existing, ...log], null, 2));
+  console.log(`✅  Log saved → ${logPath}`);
 }
 
 main().catch((err) => {
-  console.error("Fatal:", err.message);
+  console.error('Fatal:', err.message);
   process.exit(1);
 });

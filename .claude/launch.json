@@ -1,0 +1,16 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "MCP Server",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["start"],
+      "port": 9222
+    },
+    {
+      "name": "Bitget Scalper",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["scalper-run.js"]
+    }
+  ]
+}

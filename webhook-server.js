@@ -1,0 +1,352 @@
+/**
+ * TradingView → Bitget Webhook Bridge
+ * Deployed on Railway — no local machine required.
+ *
+ * Flow:
+ *   TradingView alert fires → POST /webhook/:secret → execute Bitget trade
+ *
+ * TradingView alert message format (set this when creating each alert):
+ *   {"signal":"buy","symbol":"{{ticker}}","price":{{close}},"setup":"A"}
+ *   {"signal":"sell","symbol":"{{ticker}}","price":{{close}},"setup":"A"}
+ *
+ * Environment variables (set in Railway dashboard):
+ *   WEBHOOK_SECRET      — secret token in the webhook URL (required)
+ *   BITGET_API_KEY      — Bitget API key
+ *   BITGET_SECRET_KEY   — Bitget secret key
+ *   BITGET_PASSPHRASE   — Bitget passphrase
+ *   PAPER_TRADE         — true (default) | false
+ *   PAPER_USDT_START    — virtual starting balance (default 1000)
+ *   TRADE_SIZE_USDT     — fixed $ per trade (default 1)
+ *   PORT                — set automatically by Railway
+ */
+
+import express          from 'express';
+import {
+  isConfigured, getBalances, getPrice,
+  placeOrder, getOrder, placeSellWithRetry,
+}                       from './src/core/bitget.js';
+
+// ── Config ────────────────────────────────────────────────────────────────────
+
+const PORT             = process.env.PORT             || 3000;
+const WEBHOOK_SECRET   = process.env.WEBHOOK_SECRET   || '';
+const PAPER_TRADE      = process.env.PAPER_TRADE      !== 'false';
+const PAPER_USDT_START = parseFloat(process.env.PAPER_USDT_START || '1000');
+const TRADE_SIZE_USDT  = parseFloat(process.env.TRADE_SIZE_USDT  || '1');
+
+if (!WEBHOOK_SECRET) {
+  console.warn('⚠  WEBHOOK_SECRET is not set. Set it in Railway to secure your endpoint.');
+}
+
+// ── Symbol config ─────────────────────────────────────────────────────────────
+
+const SYMBOLS = {
+  BTCUSDT: { coin: 'BTC', decimals: 6 },
+  ETHUSDT: { coin: 'ETH', decimals: 4 },
+  XRPUSDT: { coin: 'XRP', decimals: 2 },
+  SOLUSDT: { coin: 'SOL', decimals: 2 },
+  BNBUSDT: { coin: 'BNB', decimals: 3 },
+};
+
+// ── Runtime state (in-memory, resets on redeploy) ────────────────────────────
+
+const state = new Map(
+  Object.keys(SYMBOLS).map((pair) => [pair, { holding: 'usdt', buyQty: 0 }])
+);
+
+const paper = {
+  usdt:      PAPER_USDT_START,
+  positions: new Map(),
+  trades:    [],
+};
+
+const recentSignals = []; // last 50 received webhooks for the status page
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function floorTo(n, d) { return Math.floor(n * 10 ** d) / 10 ** d; }
+
+function log(msg) {
+  const ts = new Date().toISOString();
+  console.log(`[${ts}] ${msg}`);
+}
+
+async function waitForFill(orderId, pair, retries = 5) {
+  for (let i = 0; i < retries; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    try {
+      const data   = await getOrder(orderId, pair);
+      const filled = parseFloat(data?.baseVolume || 0);
+      if (filled > 0) return filled;
+    } catch { /* retry */ }
+  }
+  return 0;
+}
+
+// ── Paper trading ─────────────────────────────────────────────────────────────
+
+function paperBuy(pair, usdtAmount, price, decimals) {
+  const qty   = floorTo(usdtAmount / price, decimals);
+  paper.usdt -= usdtAmount;
+  paper.positions.set(pair, { qty, entryPrice: price, cost: usdtAmount, ts: new Date().toISOString() });
+  paper.trades.push({ ts: new Date().toISOString(), pair, side: 'buy', qty, price, cost: usdtAmount });
+  return { qty };
+}
+
+function paperSell(pair, qty, price) {
+  const proceeds = qty * price;
+  const pos      = paper.positions.get(pair);
+  const pnl      = pos ? (price - pos.entryPrice) * qty : 0;
+  paper.usdt    += proceeds;
+  paper.positions.delete(pair);
+  paper.trades.push({ ts: new Date().toISOString(), pair, side: 'sell', qty, price, proceeds, pnl });
+  return { proceeds, pnl };
+}
+
+// ── Signal parsing ────────────────────────────────────────────────────────────
+
+/**
+ * Parse incoming webhook body.
+ * Accepts JSON: { signal, symbol, price, setup }
+ * Also accepts plain text containing "buy"/"sell" + a symbol.
+ */
+function parseWebhook(body) {
+  // JSON format (preferred)
+  if (typeof body === 'object' && body !== null) {
+    const signal = (body.signal || '').toLowerCase();
+    const symbol = (body.symbol || '').toUpperCase().replace(/[^A-Z]/g, '');
+    const price  = parseFloat(body.price)  || null;
+    const setup  = (body.setup  || '?').toUpperCase();
+    if (signal === 'buy' || signal === 'sell') {
+      return { action: signal, symbol, price, setup };
+    }
+  }
+
+  // Plain text fallback — e.g. "📈 Setup A — Institutional Breakout BUY | Symbol: BTCUSDT | Price: 71000"
+  if (typeof body === 'string') {
+    const action  = /\bbuy\b/i.test(body)  ? 'buy'
+                  : /\bsell\b/i.test(body) ? 'sell'
+                  : null;
+    const symMatch = body.match(/\b(BTC|ETH|XRP|SOL|BNB)USDT\b/i);
+    const pxMatch  = body.match(/\b(\d+(?:\.\d+)?)\b/);
+    const symbol   = symMatch ? symMatch[0].toUpperCase() : null;
+    const price    = pxMatch  ? parseFloat(pxMatch[1])   : null;
+    if (action && symbol) return { action, symbol, price, setup: '?' };
+  }
+
+  return null;
+}
+
+// ── Trade execution ───────────────────────────────────────────────────────────
+
+async function executeTrade({ action, symbol, price: tvPrice, setup }) {
+  const cfg = SYMBOLS[symbol];
+  if (!cfg) {
+    return { ok: false, reason: `Symbol ${symbol} not configured. Supported: ${Object.keys(SYMBOLS).join(', ')}` };
+  }
+
+  const { coin, decimals } = cfg;
+  const s = state.get(symbol);
+
+  // Fetch live price from Bitget (more accurate than TV alert price)
+  let fillPrice = tvPrice;
+  try {
+    const ticker = await getPrice(symbol);
+    fillPrice    = ticker.last;
+  } catch { /* use TV price as fallback */ }
+
+  // ── BUY ───────────────────────────────────────────────────────────────────
+  if (action === 'buy') {
+    if (s.holding !== 'usdt') {
+      return { ok: false, reason: `Already holding ${coin} for ${symbol}` };
+    }
+
+    const available = PAPER_TRADE ? paper.usdt : await getLiveUsdt();
+    if (available < TRADE_SIZE_USDT) {
+      return { ok: false, reason: `Insufficient USDT ($${available.toFixed(2)} < $${TRADE_SIZE_USDT})` };
+    }
+
+    if (PAPER_TRADE) {
+      const { qty } = paperBuy(symbol, TRADE_SIZE_USDT, fillPrice, decimals);
+      s.holding = 'coin';
+      s.buyQty  = qty;
+      log(`📄 PAPER BUY  ${symbol}  $${TRADE_SIZE_USDT} → ${qty.toFixed(decimals)} ${coin} @ ${fillPrice}  [Setup ${setup}]`);
+      return { ok: true, mode: 'paper', side: 'buy', qty, fillPrice };
+    } else {
+      const data  = await placeOrder({ symbol, side: 'buy', size: String(TRADE_SIZE_USDT), orderType: 'market' });
+      const oid   = data?.orderId;
+      const filled = await waitForFill(oid, symbol);
+      s.holding = 'coin';
+      s.buyQty  = filled;
+      log(`✅ LIVE BUY   ${symbol}  $${TRADE_SIZE_USDT}  orderId=${oid}  filled=${filled} ${coin}  [Setup ${setup}]`);
+      return { ok: true, mode: 'live', side: 'buy', orderId: oid, filledQty: filled };
+    }
+  }
+
+  // ── SELL ──────────────────────────────────────────────────────────────────
+  if (action === 'sell') {
+    if (s.holding !== 'coin' || s.buyQty <= 0) {
+      return { ok: false, reason: `Not holding ${coin} for ${symbol}` };
+    }
+
+    const qty = floorTo(s.buyQty, decimals);
+
+    if (PAPER_TRADE) {
+      const { proceeds, pnl } = paperSell(symbol, qty, fillPrice);
+      s.holding = 'usdt';
+      s.buyQty  = 0;
+      const pnlStr = (pnl >= 0 ? '+' : '') + pnl.toFixed(4);
+      log(`📄 PAPER SELL ${symbol}  ${qty.toFixed(decimals)} ${coin} @ ${fillPrice}  proceeds=$${proceeds.toFixed(4)}  PnL=${pnlStr}  [Setup ${setup}]`);
+      return { ok: true, mode: 'paper', side: 'sell', qty, fillPrice, proceeds, pnl };
+    } else {
+      const result = await placeSellWithRetry(symbol, qty, { coinSymbol: coin });
+      if (result.ok) {
+        s.holding = 'usdt';
+        s.buyQty  = 0;
+        log(`✅ LIVE SELL  ${symbol}  ${result.soldQty} ${coin}  orderId=${result.orderId}  [Setup ${setup}]`);
+        return { ok: true, mode: 'live', side: 'sell', orderId: result.orderId, soldQty: result.soldQty };
+      } else {
+        log(`❌ SELL FAIL  ${symbol}  ${result.error}`);
+        return { ok: false, reason: result.error };
+      }
+    }
+  }
+
+  return { ok: false, reason: `Unknown action: ${action}` };
+}
+
+async function getLiveUsdt() {
+  try {
+    const assets = await getBalances(['USDT']);
+    return parseFloat(assets[0]?.available || 0);
+  } catch { return 0; }
+}
+
+// ── Express app ───────────────────────────────────────────────────────────────
+
+const app = express();
+app.use(express.json({ strict: false }));
+app.use(express.text());
+
+// ── POST /webhook/:secret ─────────────────────────────────────────────────────
+app.post('/webhook/:secret', async (req, res) => {
+  // Auth
+  if (WEBHOOK_SECRET && req.params.secret !== WEBHOOK_SECRET) {
+    log(`⛔ Rejected webhook — wrong secret`);
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const raw    = req.body;
+  const signal = parseWebhook(raw);
+
+  const record = {
+    ts:     new Date().toISOString(),
+    raw:    typeof raw === 'object' ? raw : String(raw).slice(0, 200),
+    parsed: signal,
+    result: null,
+  };
+
+  if (!signal) {
+    log(`⚠  Unparseable webhook body: ${JSON.stringify(raw)?.slice(0, 100)}`);
+    record.result = { ok: false, reason: 'Could not parse signal from body' };
+    recentSignals.unshift(record);
+    if (recentSignals.length > 50) recentSignals.pop();
+    return res.status(400).json(record.result);
+  }
+
+  log(`📨 Webhook received — ${signal.action.toUpperCase()} ${signal.symbol}  setup=${signal.setup}  price=${signal.price}`);
+
+  if (!isConfigured()) {
+    record.result = { ok: false, reason: 'Bitget credentials not configured' };
+    recentSignals.unshift(record);
+    if (recentSignals.length > 50) recentSignals.pop();
+    return res.status(503).json(record.result);
+  }
+
+  const result = await executeTrade(signal);
+  record.result = result;
+  recentSignals.unshift(record);
+  if (recentSignals.length > 50) recentSignals.pop();
+
+  res.status(result.ok ? 200 : 422).json(result);
+});
+
+// ── GET /health ───────────────────────────────────────────────────────────────
+app.get('/health', (req, res) => {
+  res.json({
+    status:      'ok',
+    mode:        PAPER_TRADE ? 'paper' : 'live',
+    trade_size:  `$${TRADE_SIZE_USDT}`,
+    configured:  isConfigured(),
+    uptime_s:    Math.floor(process.uptime()),
+  });
+});
+
+// ── GET /status ───────────────────────────────────────────────────────────────
+app.get('/status', async (req, res) => {
+  const positions = [];
+
+  for (const [pair, s] of state.entries()) {
+    const pos = { pair, holding: s.holding };
+    if (s.holding === 'coin' && s.buyQty > 0) {
+      pos.qty = s.buyQty;
+      if (PAPER_TRADE) {
+        const paperPos = paper.positions.get(pair);
+        pos.entryPrice = paperPos?.entryPrice;
+        try {
+          const { last } = await getPrice(pair);
+          pos.currentPrice = last;
+          pos.unrealisedPnl = parseFloat(((last - pos.entryPrice) * s.buyQty).toFixed(6));
+        } catch { /* skip */ }
+      }
+    }
+    positions.push(pos);
+  }
+
+  const realisedPnl = PAPER_TRADE
+    ? paper.trades.filter((t) => t.side === 'sell').reduce((sum, t) => sum + t.pnl, 0)
+    : null;
+
+  res.json({
+    mode:          PAPER_TRADE ? 'paper' : 'live',
+    trade_size:    TRADE_SIZE_USDT,
+    paper_usdt:    PAPER_TRADE ? paper.usdt : null,
+    realised_pnl:  realisedPnl,
+    positions,
+    recent_trades: PAPER_TRADE ? paper.trades.slice(-10).reverse() : [],
+    recent_signals: recentSignals.slice(0, 10),
+  });
+});
+
+// ── GET / — setup instructions ────────────────────────────────────────────────
+app.get('/', (req, res) => {
+  const secret = WEBHOOK_SECRET ? '<your-secret>' : 'NOT_SET';
+  const host   = req.headers.host || 'your-app.railway.app';
+  res.type('text').send([
+    'TradingView → Bitget Webhook Bridge',
+    '─'.repeat(40),
+    '',
+    `Mode        : ${PAPER_TRADE ? 'PAPER (no real orders)' : '🔴 LIVE'}`,
+    `Trade size  : $${TRADE_SIZE_USDT} per signal`,
+    `Bitget creds: ${isConfigured() ? '✅ configured' : '❌ missing — set BITGET_API_KEY etc.'}`,
+    `Webhook URL : POST https://${host}/webhook/${secret}`,
+    '',
+    'TradingView alert message format:',
+    '  {"signal":"buy","symbol":"{{ticker}}","price":{{close}},"setup":"A"}',
+    '  {"signal":"sell","symbol":"{{ticker}}","price":{{close}},"setup":"A"}',
+    '',
+    'Endpoints:',
+    `  GET  /health  — liveness check`,
+    `  GET  /status  — positions + P&L + recent signals`,
+    `  POST /webhook/:secret — receive TradingView alerts`,
+  ].join('\n'));
+});
+
+// ── Start ─────────────────────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  log(`🚀 Webhook server running on port ${PORT}`);
+  log(`   Mode       : ${PAPER_TRADE ? '📄 PAPER' : '🔴 LIVE'}`);
+  log(`   Trade size : $${TRADE_SIZE_USDT}`);
+  log(`   Bitget     : ${isConfigured() ? '✅ configured' : '❌ credentials missing'}`);
+  log(`   Webhook    : POST /webhook/${WEBHOOK_SECRET || '<set WEBHOOK_SECRET>'}`);
+});
