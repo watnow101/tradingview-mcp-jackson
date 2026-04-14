@@ -71,15 +71,17 @@ function log(msg) {
   console.log(`[${ts}] ${msg}`);
 }
 
-async function waitForFill(orderId, pair, retries = 5) {
+async function waitForFill(orderId, pair, retries = 10) {
   for (let i = 0; i < retries; i++) {
-    await new Promise((r) => setTimeout(r, 1000));
+    await new Promise((r) => setTimeout(r, 1500));
     try {
       const data   = await getOrder(orderId, pair);
       const filled = parseFloat(data?.baseVolume || 0);
+      log(`   Fill check ${i + 1}/${retries} — orderId=${orderId} filled=${filled}`);
       if (filled > 0) return filled;
-    } catch { /* retry */ }
+    } catch (err) { log(`   Fill check error: ${err.message}`); }
   }
+  log(`⚠  waitForFill gave up after ${retries} attempts — orderId=${orderId}`);
   return 0;
 }
 
@@ -175,7 +177,15 @@ async function executeTrade({ action, symbol, price: tvPrice, setup }) {
     } else {
       const data  = await placeOrder({ symbol, side: 'buy', size: String(TRADE_SIZE_USDT), orderType: 'market' });
       const oid   = data?.orderId;
-      const filled = await waitForFill(oid, symbol);
+      let filled = await waitForFill(oid, symbol);
+      // Fallback: if fill check returned 0, read actual coin balance from Bitget
+      if (filled <= 0) {
+        try {
+          const assets = await getBalances([coin]);
+          filled = parseFloat(assets[0]?.available || 0);
+          log(`   Fill fallback — live ${coin} balance: ${filled}`);
+        } catch { /* keep 0 */ }
+      }
       s.holding = 'coin';
       s.buyQty  = filled;
       log(`✅ LIVE BUY   ${symbol}  $${TRADE_SIZE_USDT}  orderId=${oid}  filled=${filled} ${coin}  [Setup ${setup}]`);
@@ -185,6 +195,15 @@ async function executeTrade({ action, symbol, price: tvPrice, setup }) {
 
   // ── SELL ──────────────────────────────────────────────────────────────────
   if (action === 'sell') {
+    // If buyQty is 0 (e.g. fill check failed), fall back to live balance
+    if (s.holding === 'coin' && s.buyQty <= 0) {
+      try {
+        const assets = await getBalances([coin]);
+        s.buyQty = parseFloat(assets[0]?.available || 0);
+        log(`   Sell fallback — live ${coin} balance: ${s.buyQty}`);
+      } catch { /* keep 0 */ }
+    }
+
     if (s.holding !== 'coin' || s.buyQty <= 0) {
       return { ok: false, reason: `Not holding ${coin} for ${symbol}` };
     }
