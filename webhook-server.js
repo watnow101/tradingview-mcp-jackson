@@ -33,6 +33,7 @@ const WEBHOOK_SECRET   = process.env.WEBHOOK_SECRET   || '';
 const PAPER_TRADE      = process.env.PAPER_TRADE      !== 'false';
 const PAPER_USDT_START = parseFloat(process.env.PAPER_USDT_START || '1000');
 const TRADE_SIZE_USDT  = parseFloat(process.env.TRADE_SIZE_USDT  || '1');
+const MAX_BUYS         = parseInt(process.env.MAX_BUYS           || '3');
 
 if (!WEBHOOK_SECRET) {
   console.warn('⚠  WEBHOOK_SECRET is not set. Set it in Railway to secure your endpoint.');
@@ -51,7 +52,7 @@ const SYMBOLS = {
 // ── Runtime state (in-memory, resets on redeploy) ────────────────────────────
 
 const state = new Map(
-  Object.keys(SYMBOLS).map((pair) => [pair, { holding: 'usdt', buyQty: 0 }])
+  Object.keys(SYMBOLS).map((pair) => [pair, { holding: 'usdt', buyQty: 0, buyCount: 0 }])
 );
 
 const paper = {
@@ -159,8 +160,8 @@ async function executeTrade({ action, symbol, price: tvPrice, setup }) {
 
   // ── BUY ───────────────────────────────────────────────────────────────────
   if (action === 'buy') {
-    if (s.holding !== 'usdt') {
-      return { ok: false, reason: `Already holding ${coin} for ${symbol}` };
+    if (s.holding === 'coin' && s.buyCount >= MAX_BUYS) {
+      return { ok: false, reason: `Max buys (${MAX_BUYS}) reached for ${symbol}` };
     }
 
     const available = PAPER_TRADE ? paper.usdt : await getLiveUsdt();
@@ -170,10 +171,11 @@ async function executeTrade({ action, symbol, price: tvPrice, setup }) {
 
     if (PAPER_TRADE) {
       const { qty } = paperBuy(symbol, TRADE_SIZE_USDT, fillPrice, decimals);
-      s.holding = 'coin';
-      s.buyQty  = qty;
-      log(`📄 PAPER BUY  ${symbol}  $${TRADE_SIZE_USDT} → ${qty.toFixed(decimals)} ${coin} @ ${fillPrice}  [Setup ${setup}]`);
-      return { ok: true, mode: 'paper', side: 'buy', qty, fillPrice };
+      s.holding   = 'coin';
+      s.buyQty   += qty;
+      s.buyCount += 1;
+      log(`📄 PAPER BUY  ${symbol}  $${TRADE_SIZE_USDT} → ${qty.toFixed(decimals)} ${coin} @ ${fillPrice}  [Buy ${s.buyCount}/${MAX_BUYS}] [Setup ${setup}]`);
+      return { ok: true, mode: 'paper', side: 'buy', qty, totalQty: s.buyQty, buyCount: s.buyCount, fillPrice };
     } else {
       const data  = await placeOrder({ symbol, side: 'buy', size: String(TRADE_SIZE_USDT), orderType: 'market' });
       const oid   = data?.orderId;
@@ -186,10 +188,11 @@ async function executeTrade({ action, symbol, price: tvPrice, setup }) {
           log(`   Fill fallback — live ${coin} balance: ${filled}`);
         } catch { /* keep 0 */ }
       }
-      s.holding = 'coin';
-      s.buyQty  = filled;
-      log(`✅ LIVE BUY   ${symbol}  $${TRADE_SIZE_USDT}  orderId=${oid}  filled=${filled} ${coin}  [Setup ${setup}]`);
-      return { ok: true, mode: 'live', side: 'buy', orderId: oid, filledQty: filled };
+      s.holding   = 'coin';
+      s.buyQty   += filled;
+      s.buyCount += 1;
+      log(`✅ LIVE BUY   ${symbol}  $${TRADE_SIZE_USDT}  orderId=${oid}  filled=${filled} ${coin}  [Buy ${s.buyCount}/${MAX_BUYS}] [Setup ${setup}]`);
+      return { ok: true, mode: 'live', side: 'buy', orderId: oid, filledQty: filled, totalQty: s.buyQty, buyCount: s.buyCount };
     }
   }
 
@@ -212,16 +215,18 @@ async function executeTrade({ action, symbol, price: tvPrice, setup }) {
 
     if (PAPER_TRADE) {
       const { proceeds, pnl } = paperSell(symbol, qty, fillPrice);
-      s.holding = 'usdt';
-      s.buyQty  = 0;
+      s.holding  = 'usdt';
+      s.buyQty   = 0;
+      s.buyCount = 0;
       const pnlStr = (pnl >= 0 ? '+' : '') + pnl.toFixed(4);
       log(`📄 PAPER SELL ${symbol}  ${qty.toFixed(decimals)} ${coin} @ ${fillPrice}  proceeds=$${proceeds.toFixed(4)}  PnL=${pnlStr}  [Setup ${setup}]`);
       return { ok: true, mode: 'paper', side: 'sell', qty, fillPrice, proceeds, pnl };
     } else {
       const result = await placeSellWithRetry(symbol, qty, { coinSymbol: coin });
       if (result.ok) {
-        s.holding = 'usdt';
-        s.buyQty  = 0;
+        s.holding  = 'usdt';
+        s.buyQty   = 0;
+        s.buyCount = 0;
         log(`✅ LIVE SELL  ${symbol}  ${result.soldQty} ${coin}  orderId=${result.orderId}  [Setup ${setup}]`);
         return { ok: true, mode: 'live', side: 'sell', orderId: result.orderId, soldQty: result.soldQty };
       } else {
@@ -314,7 +319,8 @@ app.get('/status', async (req, res) => {
   for (const [pair, s] of state.entries()) {
     const pos = { pair, holding: s.holding };
     if (s.holding === 'coin' && s.buyQty > 0) {
-      pos.qty = s.buyQty;
+      pos.qty      = s.buyQty;
+      pos.buyCount = `${s.buyCount}/${MAX_BUYS}`;
       if (PAPER_TRADE) {
         const paperPos = paper.positions.get(pair);
         pos.entryPrice = paperPos?.entryPrice;
