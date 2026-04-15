@@ -321,6 +321,9 @@ app.post('/webhook/:secret', async (req, res) => {
     return res.status(503).json(record.result);
   }
 
+  // Respond immediately so TradingView doesn't time out — process trade in background
+  res.status(202).json({ ok: true, status: 'processing', signal });
+
   let result;
   try {
     result = await executeTrade(signal);
@@ -331,8 +334,7 @@ app.post('/webhook/:secret', async (req, res) => {
   record.result = result;
   recentSignals.unshift(record);
   if (recentSignals.length > 50) recentSignals.pop();
-
-  res.status(result.ok ? 200 : 422).json(result);
+  log(`📋 Trade result — ${result.ok ? '✅' : '❌'} ${JSON.stringify(result)}`);
 });
 
 // ── GET /health ───────────────────────────────────────────────────────────────
