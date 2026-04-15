@@ -33,7 +33,7 @@ const WEBHOOK_SECRET   = process.env.WEBHOOK_SECRET   || '';
 const PAPER_TRADE      = process.env.PAPER_TRADE      !== 'false';
 const PAPER_USDT_START = parseFloat(process.env.PAPER_USDT_START || '1000');
 const TRADE_SIZE_USDT  = parseFloat(process.env.TRADE_SIZE_USDT  || '1');
-const MAX_BUYS         = parseInt(process.env.MAX_BUYS           || '3');
+const MAX_BUYS         = parseInt(process.env.MAX_BUYS           || '1');
 
 if (!WEBHOOK_SECRET) {
   console.warn('⚠  WEBHOOK_SECRET is not set. Set it in Railway to secure your endpoint.');
@@ -230,6 +230,15 @@ async function executeTrade({ action, symbol, price: tvPrice, setup }) {
         log(`✅ LIVE SELL  ${symbol}  ${result.soldQty} ${coin}  orderId=${result.orderId}  [Setup ${setup}]`);
         return { ok: true, mode: 'live', side: 'sell', orderId: result.orderId, soldQty: result.soldQty };
       } else {
+        // If dust is worth less than $1, reset state so future buys aren't blocked
+        const dustValue = s.buyQty * fillPrice;
+        if (dustValue < 1) {
+          s.holding  = 'usdt';
+          s.buyQty   = 0;
+          s.buyCount = 0;
+          log(`⚠  DUST RESET ${symbol}  ${s.buyQty} ${coin} worth $${dustValue.toFixed(4)} — too small to sell, resetting state`);
+          return { ok: false, reason: `Dust ignored ($${dustValue.toFixed(4)}) — state reset, ready to buy again` };
+        }
         log(`❌ SELL FAIL  ${symbol}  ${result.error}`);
         return { ok: false, reason: result.error };
       }
