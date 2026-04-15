@@ -240,6 +240,39 @@ export async function getOrderHistory(symbol = null, limit = 20) {
   return data || [];
 }
 
+/**
+ * Place a spot stop-loss plan order (trigger sell when price drops to triggerPrice).
+ *
+ * @param {object} opts
+ * @param {string}  opts.symbol        Trading pair e.g. 'BTCUSDT'
+ * @param {string}  opts.size          Coin quantity to sell
+ * @param {string}  opts.triggerPrice  Price at which to trigger the sell
+ * @returns {{ orderId: string }}
+ */
+export async function placeStopLoss({ symbol, size, triggerPrice }) {
+  const body = {
+    symbol:       symbol.toUpperCase(),
+    side:         'sell',
+    triggerPrice: String(triggerPrice),
+    orderType:    'market',
+    size:         String(size),
+    triggerType:  'fill_price',
+    force:        'gtc',
+  };
+  const data = await api('POST', '/api/v2/spot/trade/place-plan-order', body);
+  return data; // { orderId }
+}
+
+/**
+ * Cancel all open stop-loss plan orders for a symbol.
+ */
+export async function cancelPlanOrders(symbol) {
+  const data = await api('POST', '/api/v2/spot/trade/batch-cancel-plan-order', {
+    symbol: symbol.toUpperCase(),
+  });
+  return data;
+}
+
 // ─── Symbol validation (public — no auth required) ───────────────────────────
 
 /**
