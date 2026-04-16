@@ -163,6 +163,18 @@ async function executeTrade({ action, symbol, price: tvPrice, setup }) {
 
   // ── BUY ───────────────────────────────────────────────────────────────────
   if (action === 'buy') {
+    // Auto-reset dust positions before checking MAX_BUYS
+    if (s.holding === 'coin' && s.buyQty > 0) {
+      const dustValue = s.buyQty * fillPrice;
+      if (dustValue < 1) {
+        log(`⚠  DUST IGNORED ${symbol}  ${s.buyQty} ${coin} worth $${dustValue.toFixed(4)} — auto-resetting state`);
+        s.holding    = 'usdt';
+        s.buyQty     = 0;
+        s.buyCount   = 0;
+        s.entryPrice = null;
+      }
+    }
+
     if (s.holding === 'coin' && s.buyCount >= MAX_BUYS) {
       return { ok: false, reason: `Max buys (${MAX_BUYS}) reached for ${symbol}` };
     }

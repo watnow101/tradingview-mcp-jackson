@@ -1,11 +1,20 @@
 // ╔══════════════════════════════════════════════════════════════════╗
-// ║  SMC Scalper v1.0 — Smart Money Concepts (1-Min Forex)          ║
+// ║  SMC Scalper v2.0 — Smart Money Concepts (BTC Scalping Edition)  ║
 // ║  Three setups: Institutional Breakout · Liquidity Sweep          ║
 // ║                Pin Bar + Inside Bar at S/D Zone                  ║
+// ║  v2.0 — scalping-optimised for BTC/USD                           ║
+// ║    • EMAs 13/34 — balances BTC trend detection vs whipsaw        ║
+// ║    • Lower inside-bar threshold (3) for quick consolidations     ║
+// ║    • Signal cooldown prevents overtrading                        ║
+// ║    • Max SL cap keeps risk per trade bounded                     ║
+// ║    • ATR floor suppresses signals in dead volatility             ║
+// ║    • Looser Setup C pin bar window (1–3 bars back)               ║
+// ║    • Session: US+EU overlap (1300-1700 UTC) — peak BTC volume    ║
+// ║    • Tighter S/D zone detection (sd_left=5, sd_right=2)          ║
 // ╚══════════════════════════════════════════════════════════════════╝
-//@version=5
-indicator("SMC Scalper v1.0 — Inst · Sweep · Pin Bar",
-          shorttitle="SMC Scalper",
+//@version=6
+indicator("SMC Scalper v2.0 - Inst / Sweep / Pin Bar (BTC Scalp)",
+          shorttitle="SMCScalp-BTC",
           overlay=true,
           max_labels_count=500,
           max_lines_count=400,
@@ -17,46 +26,71 @@ indicator("SMC Scalper v1.0 — Inst · Sweep · Pin Bar",
 
 // ── General ──────────────────────────────────────────────────────
 var G1 = "⚙️  General"
-atr_len     = input.int(14,   "ATR Length",                         group=G1, minval=1)
-inst_mult   = input.float(2.0,"Institutional Candle Min Size (×ATR)",group=G1, step=0.1, minval=0.5)
-min_ibs     = input.int(8,    "Min Inside Bars for Channel",         group=G1, minval=3, maxval=30,
-              tooltip="Number of consecutive inside bars required before a Setup A/B signal is valid.")
+atr_len     = input.int(14,   "ATR Length",                          group=G1, minval=1)
+inst_mult   = input.float(1.3,"Institutional Candle Min Size (×ATR)", group=G1, step=0.1, minval=0.5)
+min_ibs     = input.int(3,    "Min Inside Bars for Channel",          group=G1, minval=2, maxval=10,
+              tooltip="Number of consecutive inside bars required before a Setup A/B signal is valid. Lower = more signals on fast timeframes.")
+cooldown    = input.int(5,    "Signal Cooldown (bars)",               group=G1, minval=0, maxval=30,
+              tooltip="Minimum bars between signals. Prevents overtrading on fast timeframes.")
 
 // ── Trend Filter ──────────────────────────────────────────────────
 var G2 = "📈  Trend Filter (EMA)"
-ema_f_len   = input.int(50,   "Fast EMA Length", group=G2, minval=5)
-ema_s_len   = input.int(200,  "Slow EMA Length", group=G2, minval=20)
-show_ema    = input.bool(true, "Show EMA Lines",  group=G2)
+ema_f_len   = input.int(13,   "Fast EMA Length",                      group=G2, minval=5)
+ema_s_len   = input.int(34,   "Slow EMA Length",                      group=G2, minval=10)
+// Fix #8 — ranging suppression: if EMAs are closer than N×ATR, treat as ranging
+ema_min_sep = input.float(0.3, "Min EMA Separation (×ATR) — 0 = off", group=G2, step=0.1, minval=0.0,
+              tooltip="Suppresses all signals when the two EMAs are tighter than this ATR multiple (ranging market filter). Set to 0 to disable.")
+show_ema    = input.bool(true,  "Show EMA Lines",                      group=G2)
 
 // ── Supply & Demand Zones ─────────────────────────────────────────
 var G3 = "🔶  Supply & Demand Zones"
-show_sd     = input.bool(true,  "Show S/D Zone Boxes",    group=G3)
-sd_left     = input.int(10,     "Pivot Left Bars",         group=G3, minval=2)
-sd_right    = input.int(5,      "Pivot Right Bars",        group=G3, minval=1)
-sd_zone_w   = input.float(0.4,  "Zone Width (×ATR)",       group=G3, step=0.05, minval=0.05)
-sd_prox     = input.float(1.5,  "Zone Proximity (×ATR)",   group=G3, step=0.1,  minval=0.2,
-              tooltip="How close price must be to a zone to qualify the pin bar setup.")
+show_sd     = input.bool(true,  "Show S/D Zone Boxes",                 group=G3)
+sd_left     = input.int(5,      "Pivot Left Bars",                     group=G3, minval=2)
+sd_right    = input.int(2,      "Pivot Right Bars",                    group=G3, minval=1)
+sd_zone_w   = input.float(0.4,  "Zone Width (×ATR)",                   group=G3, step=0.05, minval=0.05)
+sd_prox     = input.float(1.0,  "Zone Proximity (×ATR)",               group=G3, step=0.1, minval=0.2,
+              tooltip="How close the bar high (supply) or bar low (demand) must be to a zone level to qualify Setup C.")
+// Fix #10 — cap the number of live zones per side to avoid object-limit overflow
+max_zones   = input.int(5,      "Max Active Zones (each side)",         group=G3, minval=1, maxval=20,
+              tooltip="Oldest zones are pruned when this limit is reached. Zones are also removed when price closes cleanly through them.")
+
+// ── Risk / Reward ─────────────────────────────────────────────────
+var G_RR = "🎯  Risk / Reward"
+rr_ratio    = input.float(2.0, "Take-Profit R:R Ratio",                group=G_RR, step=0.25, minval=0.5,
+              tooltip="TP line is placed at SL-distance × this ratio from entry close.")
+max_sl_atr  = input.float(1.5, "Max SL Distance (×ATR) — 0 = off",    group=G_RR, step=0.25, minval=0.0,
+              tooltip="Clamps stop-loss distance to this ATR multiple. Signals with wider natural SL get their stop tightened. Set to 0 to disable.")
+show_tp     = input.bool(true,  "Show TP Lines",                       group=G_RR)
 
 // ── Setup C: Pin Bar ──────────────────────────────────────────────
 var G4 = "📌  Setup C — Pin Bar"
-pin_wick_pct = input.float(50.0, "Min Wick % of Total Range", group=G4, step=1.0, minval=10.0)
-use_vol      = input.bool(true,  "Require Above-Avg Volume on Pin Bar", group=G4)
-vol_ma_len   = input.int(10,     "Volume MA Length",                    group=G4, minval=2)
+pin_wick_pct  = input.float(50.0, "Min Wick % of Total Range",          group=G4, step=1.0, minval=10.0)
+pin_lookback  = input.int(3,      "Pin Bar Lookback (bars)",             group=G4, minval=1, maxval=5,
+                tooltip="How many bars back to search for a qualifying pin bar. Higher = more signals but less precision.")
+use_vol       = input.bool(true,  "Require Above-Avg Volume on Pin Bar", group=G4)
+vol_ma_len    = input.int(10,     "Volume MA Length",                    group=G4, minval=2)
+
+// ── Session Filter ────────────────────────────────────────────────
+var G6 = "🕐  Session Filter"
+use_session  = input.bool(true,     "Enable Session Filter",            group=G6)
+session_str  = input.session("1300-1700", "Allowed Session (Exchange TZ)", group=G6,
+              tooltip="Signals are suppressed outside this window. Uses the exchange's timezone. Default is US+EU overlap (UTC) — the highest BTC volume window. Disable for 24/7 trading.")
 
 // ── Display ───────────────────────────────────────────────────────
 var G5 = "🎨  Display"
-show_sigs   = input.bool(true,  "Show Signal Labels",          group=G5)
-show_sl     = input.bool(true,  "Show Stop-Loss Lines",        group=G5)
-show_ibcnt  = input.bool(true,  "Show Inside Bar Count Label", group=G5)
-col_a_b     = input.color(color.new(#00c853, 0),  "Setup A — Buy",   group=G5)
-col_a_s     = input.color(color.new(#d50000, 0),  "Setup A — Sell",  group=G5)
-col_b_b     = input.color(color.new(#00bcd4, 0),  "Setup B — Buy",   group=G5)
-col_b_s     = input.color(color.new(#9c27b0, 0),  "Setup B — Sell",  group=G5)
-col_c_b     = input.color(color.new(#8bc34a, 0),  "Setup C — Buy",   group=G5)
-col_c_s     = input.color(color.new(#ff9800, 0),  "Setup C — Sell",  group=G5)
-col_inst    = input.color(color.new(#2196f3, 75), "Institutional Box",group=G5)
-col_supply  = input.color(color.new(#ef5350, 82), "Supply Zone",      group=G5)
-col_demand  = input.color(color.new(#26a69a, 82), "Demand Zone",      group=G5)
+show_sigs     = input.bool(true,  "Show Signal Labels",                 group=G5)
+show_sl       = input.bool(true,  "Show Stop-Loss Lines",               group=G5)
+show_ibcnt    = input.bool(true,  "Show Inside Bar Count Label",        group=G5)
+show_inst_box = input.bool(true,  "Show Institutional Candle Box",      group=G5)
+col_a_b     = input.color(color.new(#00c853, 0),  "Setup A - Buy",     group=G5)
+col_a_s     = input.color(color.new(#d50000, 0),  "Setup A - Sell",    group=G5)
+col_b_b     = input.color(color.new(#00bcd4, 0),  "Setup B - Buy",     group=G5)
+col_b_s     = input.color(color.new(#9c27b0, 0),  "Setup B - Sell",    group=G5)
+col_c_b     = input.color(color.new(#8bc34a, 0),  "Setup C - Buy",     group=G5)
+col_c_s     = input.color(color.new(#ff9800, 0),  "Setup C - Sell",    group=G5)
+col_inst    = input.color(color.new(#2196f3, 75), "Institutional Box",  group=G5)
+col_supply  = input.color(color.new(#ef5350, 82), "Supply Zone",        group=G5)
+col_demand  = input.color(color.new(#26a69a, 82), "Demand Zone",        group=G5)
 
 // ═══════════════════════════════════════════════════════════════════
 // ░░  BASE INDICATORS
@@ -67,45 +101,124 @@ ema_f  = ta.ema(close, ema_f_len)
 ema_s  = ta.ema(close, ema_s_len)
 vol_ma = ta.sma(volume, vol_ma_len)
 
-uptrend   = ema_f > ema_s
-downtrend = ema_f < ema_s
+// ATR floor — suppress signals when volatility has collapsed
+atr_long = ta.atr(50)
+atr_ok   = atr >= atr_long * 0.5
+
+// Signal cooldown — track bars since last signal
+var int last_sig_bar = 0
+can_signal = cooldown == 0 or bar_index - last_sig_bar >= cooldown
+
+// Fix #8 — flag ranging when EMAs are too close relative to ATR
+ema_sep    = math.abs(ema_f - ema_s)
+is_ranging = ema_min_sep > 0.0 and ema_sep < atr * ema_min_sep
+
+uptrend   = ema_f > ema_s and not is_ranging
+downtrend = ema_f < ema_s and not is_ranging
 
 plot(show_ema ? ema_f : na, "EMA Fast", color=color.new(#2196f3, 20), linewidth=1)
 plot(show_ema ? ema_s : na, "EMA Slow", color=color.new(#ff9800,  0), linewidth=2)
-bgcolor(uptrend   ? color.new(color.green, 96) : na, title="Uptrend BG")
-bgcolor(downtrend ? color.new(color.red,   96) : na, title="Downtrend BG")
+bgcolor(uptrend    ? color.new(color.green, 96) : na, title="Uptrend BG")
+bgcolor(downtrend  ? color.new(color.red,   96) : na, title="Downtrend BG")
+bgcolor(is_ranging ? color.new(color.gray,  94) : na, title="Ranging BG")
+bgcolor(not atr_ok ? color.new(color.orange, 94) : na, title="Low Volatility BG")
+
+// Fix #11 — session gate: true when inside the allowed window (or filter is off)
+in_session = not use_session or not na(time(timeframe.period, session_str))
 
 // ═══════════════════════════════════════════════════════════════════
-// ░░  SUPPLY & DEMAND ZONES  (swing pivot boxes)
+// ░░  SUPPLY & DEMAND ZONES  (array-managed, self-cleaning)
 // ═══════════════════════════════════════════════════════════════════
+//
+// Fix #2  — zones stored in arrays; oldest pruned when max_zones is
+//           exceeded; zones invalidated when price closes through them.
+// Fix #7  — proximity test uses bar HIGH vs supply, bar LOW vs demand.
+// Fix #10 — corresponding box objects are deleted to stay well under
+//           TradingView's max_boxes_count limit.
 
-ph = ta.pivothigh(high, sd_left, sd_right)   // potential supply
-pl = ta.pivotlow (low,  sd_left, sd_right)   // potential demand
+ph = ta.pivothigh(high, sd_left, sd_right)
+pl = ta.pivotlow (low,  sd_left, sd_right)
 
-var float last_ph = na   // most recent supply level
-var float last_pl = na   // most recent demand level
+var float[] ph_levels = array.new_float()
+var box[]   ph_boxes  = array.new_box()
+var float[] pl_levels = array.new_float()
+var box[]   pl_boxes  = array.new_box()
 
+// ── Helper: create a zone box (invisible when show_sd is off) ─────
+_make_box(int x1, float top, float bot, color bg, color border) =>
+    show_sd
+      ? box.new(x1, top, x1 + 60, bot, bgcolor=bg,
+                border_color=border, border_width=1, extend=extend.right)
+      : box.new(x1, top, x1 + 60, bot,
+                bgcolor=color.new(color.white, 100),
+                border_color=color.new(color.white, 100), extend=extend.right)
+
+// ── Add new supply zone ───────────────────────────────────────────
 if not na(ph)
-    last_ph := ph
-    if show_sd
-        float hw = atr * sd_zone_w * 0.5
-        box.new(bar_index - sd_right, ph + hw, bar_index + 60, ph - hw,
-                bgcolor=col_supply,
-                border_color=color.new(color.red, 40), border_width=1,
-                extend=extend.right)
+    float hw = atr * sd_zone_w * 0.5
+    array.push(ph_levels, ph)
+    array.push(ph_boxes,  _make_box(bar_index - sd_right,
+                                     ph + hw, ph - hw,
+                                     col_supply, color.new(color.red, 40)))
+    // Prune oldest when over the cap
+    if array.size(ph_levels) > max_zones
+        box.delete(array.shift(ph_boxes))
+        array.shift(ph_levels)
 
+// ── Add new demand zone ───────────────────────────────────────────
 if not na(pl)
-    last_pl := pl
-    if show_sd
-        float hw = atr * sd_zone_w * 0.5
-        box.new(bar_index - sd_right, pl + hw, bar_index + 60, pl - hw,
-                bgcolor=col_demand,
-                border_color=color.new(color.teal, 40), border_width=1,
-                extend=extend.right)
+    float hw = atr * sd_zone_w * 0.5
+    array.push(pl_levels, pl)
+    array.push(pl_boxes,  _make_box(bar_index - sd_right,
+                                     pl + hw, pl - hw,
+                                     col_demand, color.new(color.teal, 40)))
+    if array.size(pl_levels) > max_zones
+        box.delete(array.shift(pl_boxes))
+        array.shift(pl_levels)
 
-// Zone proximity (used by Setup C)
-near_supply = not na(last_ph) and math.abs(close - last_ph) <= atr * sd_prox
-near_demand = not na(last_pl) and math.abs(close - last_pl) <= atr * sd_prox
+// ── Invalidate zones price has closed through (confirmed bars only) ─
+if barstate.isconfirmed
+    // Supply: bust when close is above the zone top
+    int i = 0
+    while i < array.size(ph_levels)
+        float lvl = array.get(ph_levels, i)
+        float top = lvl + atr * sd_zone_w * 0.5
+        if close > top
+            box.delete(array.get(ph_boxes, i))
+            array.remove(ph_levels, i)
+            array.remove(ph_boxes,  i)
+        else
+            i += 1
+
+    // Demand: bust when close is below the zone bottom
+    i := 0
+    while i < array.size(pl_levels)
+        float lvl = array.get(pl_levels, i)
+        float bot = lvl - atr * sd_zone_w * 0.5
+        if close < bot
+            box.delete(array.get(pl_boxes, i))
+            array.remove(pl_levels, i)
+            array.remove(pl_boxes,  i)
+        else
+            i += 1
+
+// ── Proximity: test ALL active zones (Fix #7 — high vs supply, low vs demand) ─
+var bool near_supply = false
+var bool near_demand = false
+
+near_supply := false
+if array.size(ph_levels) > 0
+    for i = 0 to array.size(ph_levels) - 1
+        if math.abs(high - array.get(ph_levels, i)) <= atr * sd_prox
+            near_supply := true
+            break
+
+near_demand := false
+if array.size(pl_levels) > 0
+    for i = 0 to array.size(pl_levels) - 1
+        if math.abs(low - array.get(pl_levels, i)) <= atr * sd_prox
+            near_demand := true
+            break
 
 // ═══════════════════════════════════════════════════════════════════
 // ░░  INSTITUTIONAL CANDLE  +  INSIDE BAR STATE MACHINE
@@ -113,66 +226,64 @@ near_demand = not na(last_pl) and math.abs(close - last_pl) <= atr * sd_prox
 //
 //  State flow:
 //    IDLE → [large candle] → COUNTING (track inside bars)
-//           → [>= min_ibs] → CHANNEL FORMED
-//           → breakout/sweep fires signal → IDLE
+//         → [>= min_ibs]  → CHANNEL FORMED
+//         → breakout/sweep fires signal → IDLE
 //
 // NOTE: signals are computed BEFORE the state update so that they
 //       capture the state as it was at the START of this bar.
 
-c_range  = high - low
-is_inst  = c_range >= atr * inst_mult   // institutional candle detected
+c_range = high - low
+is_inst = c_range >= atr * inst_mult
 
-// Persistent state
-var float ic_hi    = na      // institutional candle high
-var float ic_lo    = na      // institutional candle low
-var int   ic_idx   = na      // bar index of institutional candle
-var int   ib_cnt   = 0       // consecutive inside bar count
-var bool  ib_brk   = false   // inside-bar sequence has been broken
-var bool  ch_ready = false   // channel fully formed (>= min_ibs inside bars)
-var box   ic_bx    = na      // box object for institutional range
+var float ic_hi    = na
+var float ic_lo    = na
+var int   ic_idx   = na
+var int   ib_cnt   = 0
+var bool  ib_brk   = false
+var bool  ch_ready = false
+var box   ic_bx    = na
 
-// ── Step 1: compute signals using state FROM PREVIOUS BAR ─────────
+// ── Step 1: compute signals from state of PREVIOUS bar ────────────
+// Gated on: confirmed bar, cooldown, ATR floor, session, trend
+a_buy  = barstate.isconfirmed and ch_ready and not na(ic_hi) and close > ic_hi and uptrend   and in_session and can_signal and atr_ok
+a_sell = barstate.isconfirmed and ch_ready and not na(ic_lo) and close < ic_lo and downtrend and in_session and can_signal and atr_ok
 
-// Setup A — Institutional Breakout (continuation)
-a_buy  = ch_ready and not na(ic_hi) and close > ic_hi and uptrend
-a_sell = ch_ready and not na(ic_lo) and close < ic_lo and downtrend
-
-// Setup B — Liquidity Sweep (wick outside, close back inside)
-//   bull sweep: low pierces below channel → closes back above ic_lo → BUY
-//   bear sweep: high pierces above channel → closes back below ic_hi → SELL
-b_buy  = ch_ready and not na(ic_lo) and low  < ic_lo and close > ic_lo  and uptrend   and not a_buy
-b_sell = ch_ready and not na(ic_hi) and high > ic_hi and close < ic_hi  and downtrend and not a_sell
+// Setup B — liquidity sweep: wick outside channel, close back inside
+b_buy  = barstate.isconfirmed and ch_ready and not na(ic_lo) and low  < ic_lo and close > ic_lo and uptrend   and not a_buy  and in_session and can_signal and atr_ok
+b_sell = barstate.isconfirmed and ch_ready and not na(ic_hi) and high > ic_hi and close < ic_hi and downtrend and not a_sell and in_session and can_signal and atr_ok
 
 any_signal = a_buy or a_sell or b_buy or b_sell
 
-// ── Step 2: reset state when a signal fires ───────────────────────
+// ── Step 2: reset state + update cooldown when a signal fires ─────
 if any_signal
-    ch_ready := false
-    ib_brk   := true
+    ch_ready     := false
+    ib_brk       := true
+    last_sig_bar := bar_index
 
 // ── Step 3: update state machine ─────────────────────────────────
 if is_inst
-    // New institutional candle — reset everything
-    ic_hi    := high
-    ic_lo    := low
-    ic_idx   := bar_index
-    ib_cnt   := 0
-    ib_brk   := false
-    ch_ready := false
-    if show_inst_box  // will be defined below but Pine allows forward refs for booleans set earlier
-        ic_bx := box.new(bar_index, high, bar_index + 1, low,
-                         bgcolor=col_inst,
-                         border_color=color.new(#2196f3, 20), border_width=1)
+    // Fix #5 — only clobber an active channel if the new institutional
+    //           candle is larger (a more dominant move). This avoids
+    //           wiping a near-ready channel on a marginal spike.
+    bool replace = na(ic_idx) or ib_brk or c_range > (ic_hi - ic_lo)
+    if replace
+        ic_hi    := high
+        ic_lo    := low
+        ic_idx   := bar_index
+        ib_cnt   := 0
+        ib_brk   := false
+        ch_ready := false
+        if show_inst_box
+            ic_bx := box.new(bar_index, high, bar_index + 1, low,
+                             bgcolor=col_inst,
+                             border_color=color.new(#2196f3, 20), border_width=1)
 
 else if not na(ic_idx) and not ib_brk
     if high <= ic_hi and low >= ic_lo
-        // Still inside the channel
-        ib_cnt   += 1
-        ch_ready  := ib_cnt >= min_ibs
-        // Extend institutional box to cover this inside bar
+        ib_cnt  += 1
+        ch_ready := ib_cnt >= min_ibs
         if not na(ic_bx)
             box.set_right(ic_bx, bar_index + 1)
-        // Label inside bar count when threshold is first hit
         if show_ibcnt and ib_cnt == min_ibs
             label.new(bar_index, ic_hi + atr * 0.6,
                       str.tostring(ib_cnt) + " IBs ✓",
@@ -181,54 +292,83 @@ else if not na(ic_idx) and not ib_brk
                       textcolor=color.white,
                       size=size.tiny)
     else
-        // Bar broke out without a valid signal (e.g. random breakout)
+        // Fix #9 — fully reset state on a non-signal channel break
+        //           (previously only ib_brk was set, leaving ch_ready=true)
         if not any_signal
-            ib_brk := true
-
-// Expose input used inside if-block above (avoids "undefined" error)
-show_inst_box = input.bool(true, "Show Institutional Candle Box", group=G5)
+            ib_brk   := true
+            ch_ready := false
+            ib_cnt   := 0
 
 // ═══════════════════════════════════════════════════════════════════
 // ░░  SETUP C — PIN BAR + INSIDE BAR AT S/D ZONE
 // ═══════════════════════════════════════════════════════════════════
 
-bar_rng    = high - low
-up_wick    = high - math.max(open, close)
-dn_wick    = math.min(open, close) - low
-body_sz    = math.abs(close - open)
+bar_rng  = high - low
+up_wick  = high - math.max(open, close)
+dn_wick  = math.min(open, close) - low
+body_sz  = math.abs(close - open)
 
 dn_wick_pct = bar_rng > 0 ? dn_wick / bar_rng * 100 : 0.0
 up_wick_pct = bar_rng > 0 ? up_wick / bar_rng * 100 : 0.0
 
-bull_pin = dn_wick_pct >= pin_wick_pct and dn_wick > body_sz   // bullish rejection (long lower wick)
-bear_pin = up_wick_pct >= pin_wick_pct and up_wick > body_sz   // bearish rejection (long upper wick)
+bull_pin = dn_wick_pct >= pin_wick_pct and dn_wick > body_sz
+bear_pin = up_wick_pct >= pin_wick_pct and up_wick > body_sz
 
-// Current bar is inside the prior bar (= confirmation candle)
-is_inside   = high <= high[1] and low >= low[1]
+is_inside = high <= high[1] and low >= low[1]
+vol_ok    = not use_vol or volume[1] > vol_ma[1]
 
-// Volume filter applied to the pin bar (bar[1])
-vol_ok      = not use_vol or volume[1] > vol_ma[1]
+// Looser pin bar window: search up to pin_lookback bars back
+recent_bull_pin = false
+recent_bear_pin = false
+recent_near_demand = false
+recent_near_supply = false
+for lb = 1 to pin_lookback
+    if bull_pin[lb]
+        recent_bull_pin := true
+    if bear_pin[lb]
+        recent_bear_pin := true
+    if near_demand[lb]
+        recent_near_demand := true
+    if near_supply[lb]
+        recent_near_supply := true
 
-// Pin bar must have occurred AT an S/D zone
-c_buy  = is_inside and bull_pin[1] and near_demand[1] and uptrend   and vol_ok
-c_sell = is_inside and bear_pin[1] and near_supply[1] and downtrend and vol_ok
+// Gated on: confirmed bar, cooldown, ATR floor, session, trend
+c_buy  = barstate.isconfirmed and is_inside and recent_bull_pin and recent_near_demand and uptrend   and vol_ok and in_session and can_signal and atr_ok
+c_sell = barstate.isconfirmed and is_inside and recent_bear_pin and recent_near_supply and downtrend and vol_ok and in_session and can_signal and atr_ok
+
+// Update cooldown for Setup C signals
+if c_buy or c_sell
+    last_sig_bar := bar_index
 
 // ═══════════════════════════════════════════════════════════════════
-// ░░  SIGNAL LABELS  &  STOP-LOSS LINES
+// ░░  SIGNAL LABELS, SL & TP LINES
 // ═══════════════════════════════════════════════════════════════════
+//
+// Fix #1  — TP lines drawn at entry ± sl_dist × rr_ratio
+// Fix #4  — Setup B SL widened from 0.2×ATR to 0.5×ATR (below/above wick)
 
-off = atr * 1.3   // label vertical offset
+off = atr * 1.3
+
+// Helper: clamp SL distance to max_sl_atr if enabled
+_clamp_sl(float raw_dist) =>
+    max_sl_atr > 0.0 ? math.min(raw_dist, atr * max_sl_atr) : raw_dist
 
 if show_sigs
-    // ── Setup A ──────────────────────────────────────────────────
+    // ── Setup A — Institutional Breakout ─────────────────────────
     if a_buy
         label.new(bar_index, low - off,
                   "A ▲  Breakout Buy",
                   style=label.style_label_up,
                   color=color.new(col_a_b, 5), textcolor=color.white, size=size.small)
         if show_sl
-            line.new(bar_index, ic_lo, bar_index + 15, ic_lo,
+            float sl_dist = _clamp_sl(close - ic_lo)
+            float sl      = close - sl_dist
+            line.new(bar_index, sl, bar_index + 15, sl,
                      color=color.new(color.red, 20), style=line.style_dashed, width=1)
+            if show_tp
+                float tp = close + sl_dist * rr_ratio
+                line.new(bar_index, tp, bar_index + 15, tp,
+                         color=color.new(color.green, 20), style=line.style_dashed, width=2)
 
     if a_sell
         label.new(bar_index, high + off,
@@ -236,20 +376,30 @@ if show_sigs
                   style=label.style_label_down,
                   color=color.new(col_a_s, 5), textcolor=color.white, size=size.small)
         if show_sl
-            line.new(bar_index, ic_hi, bar_index + 15, ic_hi,
+            float sl_dist = _clamp_sl(ic_hi - close)
+            float sl      = close + sl_dist
+            line.new(bar_index, sl, bar_index + 15, sl,
                      color=color.new(color.green, 20), style=line.style_dashed, width=1)
+            if show_tp
+                float tp = close - sl_dist * rr_ratio
+                line.new(bar_index, tp, bar_index + 15, tp,
+                         color=color.new(color.red, 20), style=line.style_dashed, width=2)
 
-    // ── Setup B ──────────────────────────────────────────────────
+    // ── Setup B — Liquidity Sweep ─────────────────────────────────
     if b_buy
         label.new(bar_index, low - off,
                   "B ▲  Sweep Buy",
                   style=label.style_label_up,
                   color=color.new(col_b_b, 5), textcolor=color.white, size=size.small)
         if show_sl
-            // SL = just below the sweep wick
-            float sl_b = low - atr * 0.2
-            line.new(bar_index, sl_b, bar_index + 15, sl_b,
+            float sl_dist = _clamp_sl(close - (low - atr * 0.5))
+            float sl      = close - sl_dist
+            line.new(bar_index, sl, bar_index + 15, sl,
                      color=color.new(color.red, 20), style=line.style_dashed, width=1)
+            if show_tp
+                float tp = close + sl_dist * rr_ratio
+                line.new(bar_index, tp, bar_index + 15, tp,
+                         color=color.new(color.green, 20), style=line.style_dashed, width=2)
 
     if b_sell
         label.new(bar_index, high + off,
@@ -257,20 +407,30 @@ if show_sigs
                   style=label.style_label_down,
                   color=color.new(col_b_s, 5), textcolor=color.white, size=size.small)
         if show_sl
-            float sl_s = high + atr * 0.2
-            line.new(bar_index, sl_s, bar_index + 15, sl_s,
+            float sl_dist = _clamp_sl((high + atr * 0.5) - close)
+            float sl      = close + sl_dist
+            line.new(bar_index, sl, bar_index + 15, sl,
                      color=color.new(color.green, 20), style=line.style_dashed, width=1)
+            if show_tp
+                float tp = close - sl_dist * rr_ratio
+                line.new(bar_index, tp, bar_index + 15, tp,
+                         color=color.new(color.red, 20), style=line.style_dashed, width=2)
 
-    // ── Setup C ──────────────────────────────────────────────────
+    // ── Setup C — Pin Bar at S/D Zone ─────────────────────────────
     if c_buy
         label.new(bar_index, low - off,
                   "C ▲  Pin Buy",
                   style=label.style_label_up,
                   color=color.new(col_c_b, 5), textcolor=color.white, size=size.small)
         if show_sl
-            // SL = below the pin bar low (bar[1])
-            line.new(bar_index, low[1], bar_index + 15, low[1],
+            float sl_dist = _clamp_sl(close - low[1])
+            float sl      = close - sl_dist
+            line.new(bar_index, sl, bar_index + 15, sl,
                      color=color.new(color.red, 20), style=line.style_dashed, width=1)
+            if show_tp
+                float tp = close + sl_dist * rr_ratio
+                line.new(bar_index, tp, bar_index + 15, tp,
+                         color=color.new(color.green, 20), style=line.style_dashed, width=2)
 
     if c_sell
         label.new(bar_index, high + off,
@@ -278,43 +438,53 @@ if show_sigs
                   style=label.style_label_down,
                   color=color.new(col_c_s, 5), textcolor=color.white, size=size.small)
         if show_sl
-            // SL = above the pin bar high (bar[1])
-            line.new(bar_index, high[1], bar_index + 15, high[1],
+            float sl_dist = _clamp_sl(high[1] - close)
+            float sl      = close + sl_dist
+            line.new(bar_index, sl, bar_index + 15, sl,
                      color=color.new(color.green, 20), style=line.style_dashed, width=1)
+            if show_tp
+                float tp = close - sl_dist * rr_ratio
+                line.new(bar_index, tp, bar_index + 15, tp,
+                         color=color.new(color.red, 20), style=line.style_dashed, width=2)
 
 // ═══════════════════════════════════════════════════════════════════
 // ░░  ALERTS
 // ═══════════════════════════════════════════════════════════════════
 
-// Inside bar formation warning
+// ── Individual alerts (for monitoring / notifications) ────────────
+
+// Inside bar channel formed (informational — not a trade signal)
 alertcondition(ib_cnt == min_ibs,
-               title="🔔 Inside Bar Channel Formed",
-               message="{{ticker}} 1m — " + str.tostring(min_ibs) + " inside bars formed after Institutional Candle. Breakout imminent.")
+               title="Inside Bar Channel Formed",
+               message="{{ticker}} {{interval}} — Inside bar channel formed. Breakout imminent.")
 
 // Setup A
 alertcondition(a_buy,
                title="[A] Breakout Buy",
-               message="📈 {{ticker}} 1m — Setup A: Institutional Channel Breakout BUY  |  Price: {{close}}")
+               message='{"signal":"buy","symbol":"{{ticker}}","price":{{close}},"setup":"A"}')
 alertcondition(a_sell,
                title="[A] Breakout Sell",
-               message="📉 {{ticker}} 1m — Setup A: Institutional Channel Breakout SELL  |  Price: {{close}}")
+               message='{"signal":"sell","symbol":"{{ticker}}","price":{{close}},"setup":"A"}')
 
 // Setup B
 alertcondition(b_buy,
                title="[B] Sweep Buy",
-               message="📈 {{ticker}} 1m — Setup B: Liquidity Sweep BUY (False Breakdown)  |  Price: {{close}}")
+               message='{"signal":"buy","symbol":"{{ticker}}","price":{{close}},"setup":"B"}')
 alertcondition(b_sell,
                title="[B] Sweep Sell",
-               message="📉 {{ticker}} 1m — Setup B: Liquidity Sweep SELL (False Breakout)  |  Price: {{close}}")
+               message='{"signal":"sell","symbol":"{{ticker}}","price":{{close}},"setup":"B"}')
 
 // Setup C
 alertcondition(c_buy,
                title="[C] Pin Bar Buy",
-               message="📈 {{ticker}} 1m — Setup C: Pin Bar + Inside Bar BUY at Demand Zone  |  Price: {{close}}")
+               message='{"signal":"buy","symbol":"{{ticker}}","price":{{close}},"setup":"C"}')
 alertcondition(c_sell,
                title="[C] Pin Bar Sell",
-               message="📉 {{ticker}} 1m — Setup C: Pin Bar + Inside Bar SELL at Supply Zone  |  Price: {{close}}")
+               message='{"signal":"sell","symbol":"{{ticker}}","price":{{close}},"setup":"C"}')
 
-// Combined
-alertcondition(a_buy  or b_buy  or c_buy,  title="Any Buy Signal",  message="📈 SMC Scalper — BUY signal on {{ticker}} 1m")
-alertcondition(a_sell or b_sell or c_sell, title="Any Sell Signal", message="📉 SMC Scalper — SELL signal on {{ticker}} 1m")
+// ── Combined alerts (recommended for webhook trading) ─────────────
+// Use these two — they catch all three setups in one alert each.
+alertcondition(a_buy  or b_buy  or c_buy,  title="⚡ Any Buy Signal",
+               message='{"signal":"buy","symbol":"{{ticker}}","price":{{close}},"setup":"ABC"}')
+alertcondition(a_sell or b_sell or c_sell, title="⚡ Any Sell Signal",
+               message='{"signal":"sell","symbol":"{{ticker}}","price":{{close}},"setup":"ABC"}')
