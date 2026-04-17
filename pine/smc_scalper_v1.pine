@@ -9,7 +9,7 @@
 // ║    • Max SL cap keeps risk per trade bounded                     ║
 // ║    • ATR floor suppresses signals in dead volatility             ║
 // ║    • Looser Setup C pin bar window (1–3 bars back)               ║
-// ║    • Session: US+EU overlap (1300-1700 UTC) — peak BTC volume    ║
+// ║    • Session filter OFF by default — 24/7 BTC trading            ║
 // ║    • Tighter S/D zone detection (sd_left=5, sd_right=2)          ║
 // ╚══════════════════════════════════════════════════════════════════╝
 //@version=6
@@ -72,9 +72,9 @@ vol_ma_len    = input.int(10,     "Volume MA Length",                    group=G
 
 // ── Session Filter ────────────────────────────────────────────────
 var G6 = "🕐  Session Filter"
-use_session  = input.bool(true,     "Enable Session Filter",            group=G6)
+use_session  = input.bool(false,    "Enable Session Filter",            group=G6)
 session_str  = input.session("1300-1700", "Allowed Session (Exchange TZ)", group=G6,
-              tooltip="Signals are suppressed outside this window. Uses the exchange's timezone. Default is US+EU overlap (UTC) — the highest BTC volume window. Disable for 24/7 trading.")
+              tooltip="Signals are suppressed outside this window. Uses the exchange's timezone. Default is US+EU overlap (UTC) — the highest BTC volume window. Disabled by default for 24/7 BTC trading.")
 
 // ── Display ───────────────────────────────────────────────────────
 var G5 = "🎨  Display"
