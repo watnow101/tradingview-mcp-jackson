@@ -33,10 +33,11 @@ const PORT             = process.env.PORT             || 3000;
 const WEBHOOK_SECRET   = process.env.WEBHOOK_SECRET   || '';
 const PAPER_TRADE      = process.env.PAPER_TRADE      !== 'false';
 const PAPER_USDT_START = parseFloat(process.env.PAPER_USDT_START || '1000');
-const TRADE_SIZE_USDT  = parseFloat(process.env.TRADE_SIZE_USDT  || '1');
+const TRADE_SIZE_USDT  = parseFloat(process.env.TRADE_SIZE_USDT  || '20');
 const MAX_BUYS         = parseInt(process.env.MAX_BUYS           || '1');
 const STOP_LOSS_PCT    = parseFloat(process.env.STOP_LOSS_PCT    || '0.5');
 const SL_CHECK_MS      = parseInt(process.env.SL_CHECK_MS        || '30000');
+const MIN_NOTIONAL     = parseFloat(process.env.MIN_NOTIONAL     || '10'); // Bitget minimum order value in USDT
 
 if (!WEBHOOK_SECRET) {
   console.warn('⚠  WEBHOOK_SECRET is not set. Set it in Railway to secure your endpoint.');
@@ -242,6 +243,17 @@ async function executeTrade({ action, symbol, price: tvPrice, setup }) {
     }
 
     const qty = floorTo(s.buyQty, decimals);
+
+    // Minimum notional check — warn and reset if position is too small to sell
+    const notionalValue = qty * fillPrice;
+    if (notionalValue < MIN_NOTIONAL) {
+      log(`⚠  MIN NOTIONAL ${symbol}  ${qty} ${coin} worth $${notionalValue.toFixed(4)} < $${MIN_NOTIONAL} minimum — resetting dust state`);
+      s.holding    = 'usdt';
+      s.buyQty     = 0;
+      s.buyCount   = 0;
+      s.entryPrice = null;
+      return { ok: false, reason: `Position too small to sell ($${notionalValue.toFixed(4)} < $${MIN_NOTIONAL} minimum) — state reset, ready to buy again` };
+    }
 
     if (PAPER_TRADE) {
       const { proceeds, pnl } = paperSell(symbol, qty, fillPrice);
